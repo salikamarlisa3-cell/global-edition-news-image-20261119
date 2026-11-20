@@ -1,1009 +1,570 @@
-# SPDX-License-Identifier: MIT
-"""THE WORLD IN ONE DAY - Thursday 19 November 2026.
+#!/usr/bin/env python3
+"""The Global Edition — Thursday 19 November 2026.
 
-A one-image world-news poster for make.fun's news-image-20261119 bounty.
-The program draws the whole front page itself - masthead, UTC timeline,
-dot-matrix world map with numbered pins, 17 illustrated feature panels,
-35 numbered briefs, a by-the-numbers box, a weather & disaster box and a
-date-check box - with a small software rasterizer written for this entry
-(pure Python standard library: no network, no external assets, fully
-deterministic). Every story was reported on 19 November 2026 by the
-outlet named on the page; SOURCES.md maps each number to its report.
-
-Run:  python3 main.py            (writes /output/entry.png)
-      MAKEFUN_OUTPUT_DIR=out python3 main.py
+Draws a one-page poster of the day's world news: 52 stories from named
+outlets, 17 illustrated panels, a dot-matrix world map with a pin for
+every featured story, a UTC timeline, a by-the-numbers strip, a markets
+strip and a date-check box. Pillow only, fully deterministic: the same
+image bytes on every run. Writes entry.png to $MAKEFUN_OUTPUT_DIR
+(default /output).
 """
 
+import math
 import os
-import struct
-import zlib
 
-W, H = 1024, 1024
+from PIL import Image, ImageDraw, ImageFont
 
+W = H = 1024
+PAPER = (247, 242, 231)
+INK = (26, 26, 46)
+FAINT = (110, 104, 92)
+RED = (179, 57, 46)
+BLUE = (36, 86, 166)
+GOLD = (178, 132, 20)
+GREEN = (46, 120, 74)
+SKY = (214, 228, 240)
+SAND = (238, 226, 198)
+GREY = (198, 194, 184)
 
-# ---------------------------------------------------------------- PNG out
-def save_png(path, w, h, rgb):
-    def chunk(tag, data):
-        c = struct.pack(">I", len(data)) + tag + data
-        return c + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
-
-    raw = bytearray()
-    stride = w * 3
-    for y in range(h):
-        raw.append(0)
-        raw += rgb[y * stride:(y + 1) * stride]
-    ihdr = struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)
-    png = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr)
-           + chunk(b"IDAT", zlib.compress(bytes(raw), 9))
-           + chunk(b"IEND", b""))
-    with open(path, "wb") as f:
-        f.write(png)
+SERIF_B = "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf"
+SANS = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+SANS_B = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 
 
-# ---------------------------------------------------------------- canvas
-class Canvas:
-    def __init__(self, w, h, bg):
-        self.w, self.h = w, h
-        self.px = bytearray(bg * (w * h))
-
-    def set(self, x, y, col):
-        if 0 <= x < self.w and 0 <= y < self.h:
-            i = (y * self.w + x) * 3
-            self.px[i:i + 3] = bytes(col)
-
-    def rect(self, x, y, w, h, col):
-        x0, y0 = max(0, x), max(0, y)
-        x1, y1 = min(self.w, x + w), min(self.h, y + h)
-        row = bytes(col) * (x1 - x0)
-        for yy in range(y0, y1):
-            i = (yy * self.w + x0) * 3
-            self.px[i:i + len(row)] = row
-
-    def frame(self, x, y, w, h, col, t=1):
-        self.rect(x, y, w, t, col)
-        self.rect(x, y + h - t, w, t, col)
-        self.rect(x, y, t, h, col)
-        self.rect(x + w - t, y, t, h, col)
-
-    def line(self, x0, y0, x1, y1, col, t=1):
-        dx, dy = x1 - x0, y1 - y0
-        steps = max(abs(dx), abs(dy), 1)
-        r = t // 2
-        for i in range(steps + 1):
-            x = x0 + dx * i // steps
-            y = y0 + dy * i // steps
-            self.rect(x - r, y - r, t, t, col)
-
-    def circle(self, cx, cy, r, col, fill=True):
-        for yy in range(cy - r, cy + r + 1):
-            for xx in range(cx - r, cx + r + 1):
-                d2 = (xx - cx) ** 2 + (yy - cy) ** 2
-                if fill and d2 <= r * r:
-                    self.set(xx, yy, col)
-                elif not fill and r * r - 2 * r <= d2 <= r * r + 2 * r:
-                    self.set(xx, yy, col)
-
-    def poly(self, pts, col):
-        ys = [p[1] for p in pts]
-        for yy in range(min(ys), max(ys) + 1):
-            xs = []
-            n = len(pts)
-            for i in range(n):
-                x0, y0 = pts[i]
-                x1, y1 = pts[(i + 1) % n]
-                if (y0 <= yy < y1) or (y1 <= yy < y0):
-                    xs.append(x0 + (yy - y0) * (x1 - x0) // (y1 - y0))
-            xs.sort()
-            for i in range(0, len(xs) - 1, 2):
-                self.rect(xs[i], yy, xs[i + 1] - xs[i] + 1, 1, col)
+def font(path, size):
+    return ImageFont.truetype(path, size)
 
 
-# ---------------------------------------------------------------- font
-# Hand-drawn 5x7 pixel font (this entry's own letterforms), one entry per
-# character: seven rows of five bits, top row first.
-_G = {
-    " ": "00000 00000 00000 00000 00000 00000 00000",
-    "A": "01110 10001 10001 11111 10001 10001 10001",
-    "B": "11110 10001 10001 11110 10001 10001 11110",
-    "C": "01110 10001 10000 10000 10000 10001 01110",
-    "D": "11100 10010 10001 10001 10001 10010 11100",
-    "E": "11111 10000 10000 11110 10000 10000 11111",
-    "F": "11111 10000 10000 11110 10000 10000 10000",
-    "G": "01110 10001 10000 10111 10001 10001 01111",
-    "H": "10001 10001 10001 11111 10001 10001 10001",
-    "I": "01110 00100 00100 00100 00100 00100 01110",
-    "J": "00111 00010 00010 00010 00010 10010 01100",
-    "K": "10001 10010 10100 11000 10100 10010 10001",
-    "L": "10000 10000 10000 10000 10000 10000 11111",
-    "M": "10001 11011 10101 10101 10001 10001 10001",
-    "N": "10001 10001 11001 10101 10011 10001 10001",
-    "O": "01110 10001 10001 10001 10001 10001 01110",
-    "P": "11110 10001 10001 11110 10000 10000 10000",
-    "Q": "01110 10001 10001 10001 10101 10010 01101",
-    "R": "11110 10001 10001 11110 10100 10010 10001",
-    "S": "01111 10000 10000 01110 00001 00001 11110",
-    "T": "11111 00100 00100 00100 00100 00100 00100",
-    "U": "10001 10001 10001 10001 10001 10001 01110",
-    "V": "10001 10001 10001 10001 10001 01010 00100",
-    "W": "10001 10001 10001 10101 10101 10101 01010",
-    "X": "10001 01010 00100 00100 00100 01010 10001",
-    "Y": "10001 01010 00100 00100 00100 00100 00100",
-    "Z": "11111 00001 00010 00100 01000 10000 11111",
-    "0": "01110 10001 10011 10101 11001 10001 01110",
-    "1": "00100 01100 00100 00100 00100 00100 01110",
-    "2": "01110 10001 00001 00010 00100 01000 11111",
-    "3": "11111 00010 00100 00010 00001 10001 01110",
-    "4": "00010 00110 01010 10010 11111 00010 00010",
-    "5": "11111 10000 11110 00001 00001 10001 01110",
-    "6": "00110 01000 10000 11110 10001 10001 01110",
-    "7": "11111 00001 00010 00100 01000 01000 01000",
-    "8": "01110 10001 10001 01110 10001 10001 01110",
-    "9": "01110 10001 10001 01111 00001 00010 01100",
-    ".": "00000 00000 00000 00000 00000 01100 01100",
-    ",": "00000 00000 00000 00000 01100 00100 01000",
-    ":": "00000 01100 01100 00000 01100 01100 00000",
-    ";": "00000 01100 01100 00000 01100 00100 01000",
-    "'": "00100 00100 01000 00000 00000 00000 00000",
-    "-": "00000 00000 00000 01110 00000 00000 00000",
-    "/": "00001 00010 00010 00100 01000 01000 10000",
-    "(": "00010 00100 01000 01000 01000 00100 00010",
-    ")": "01000 00100 00010 00010 00010 00100 01000",
-    "!": "00100 00100 00100 00100 00100 00000 00100",
-    "?": "01110 10001 00001 00110 00100 00000 00100",
-    "%": "11001 11010 00010 00100 01000 01011 10011",
-    "+": "00000 00100 00100 01110 00100 00100 00000",
-    "&": "01100 10010 10100 01000 10101 10010 01101",
-    "$": "00100 01111 10100 01110 00101 11110 00100",
-    "#": "01010 01010 11111 01010 11111 01010 01010",
-    "@": "01110 10001 10111 10101 10110 10000 01110",
-    "*": "00000 00100 10101 01110 10101 00100 00000",
-    '"': "01010 01010 00000 00000 00000 00000 00000",
-    "<": "00010 00100 01000 10000 01000 00100 00010",
-    ">": "01000 00100 00010 00001 00010 00100 01000",
-    "=": "00000 00000 11111 00000 11111 00000 00000",
-    "_": "00000 00000 00000 00000 00000 00000 11111",
-    "[": "01110 01000 01000 01000 01000 01000 01110",
-    "]": "01110 00010 00010 00010 00010 00010 01110",
-}
-FONT = {c: [int(r, 2) for r in rows.split()] for c, rows in _G.items()}
+# ---------------------------------------------------------------- stories
+# (number, headline, outlet, region, glyph, pin lon/lat or None)
+STORIES = [
+    (1, "Trump, Xi, Putin hold first trilateral summit", "USA Today",
+     "ASIA", "flags", (114.1, 22.6)),
+    (2, "World Court delivers Gambia v. Myanmar judgment", "Reuters",
+     "EUROPE", "gavel", (4.3, 52.1)),
+    (3, "Crimea Bridge hit a third time; traffic halted", "Independent",
+     "EUROPE", "bridge", (34.1, 45.0)),
+    (4, "IG Metall calls 24h strikes in auto and steel", "Reuters",
+     "EUROPE", "factory", (10.4, 51.1)),
+    (5, "Dozens missing as migrant boat capsizes", "Reuters",
+     "AFRICA", "boat", (-17.4, 14.7)),
+    (6, "COP31 final stretch; new draft text due", "Reuters",
+     "CLIMATE", "globe", (30.7, 36.9)),
+    (7, "Hawkish Fed minutes; Wall St's 5th straight loss", "CaixaBank",
+     "AMERICAS", "chartdown", (-74.0, 40.7)),
+    (8, "Anthropic lists on Nasdaq, IPO priced at $83", "IC Markets",
+     "AMERICAS", "chip", (-73.9, 40.75)),
+    (9, "GTA VI launch day: midnight unlocks worldwide", "Rockstar",
+     "AMERICAS", "game", (-118.2, 34.1)),
+    (10, "Giannis faces Bucks first time; Heat win 137-130", "Reuters",
+     "AMERICAS", "ball", (-80.2, 25.8)),
+    (11, "Bangladesh lockdown day; Hasina return fears", "Daily Star",
+     "ASIA", "lock", (90.4, 23.8)),
+    (12, "Saudi coalition repels missiles toward Riyadh", "Al Jazeera",
+     "MIDEAST", "missile", (46.7, 24.6)),
+    (13, "Venezuela touts AI for cleaner oil at COP31", "Reuters",
+     "AMERICAS", "oilleaf", (-66.9, 10.5)),
+    (14, "UNHCR halts refugee registration in Malaysia", "Reuters",
+     "ASIA", "idcard", (101.7, 3.1)),
+    (15, "Indonesia parliament passes asset forfeiture law", "Reuters",
+     "ASIA", "scales", (106.8, -6.2)),
+    (16, "Ethiopian Airlines probes ShebaMiles data breach", "Reuters",
+     "AFRICA", "plane", (38.7, 9.0)),
+    (17, "PHP ships critical security release, all versions", "PHP.net",
+     "TECH", "code", (-30.0, 32.0)),
+    (18, "Trump-Xi bilateral working lunch in Shenzhen", "AFP",
+     "ASIA", None, None),
+    (19, "APEC leaders' meeting, Shenzhen, 18-19 Nov", "Diplomatic Watch",
+     "ASIA", None, None),
+    (20, "Putin: all three want the Ukraine war resolved", "USA Today",
+     "ASIA", None, None),
+    (21, "Elon Musk accompanies Trump to China", "BBN Times",
+     "ASIA", None, None),
+    (22, "Russian drones damage 29 homes in Kyiv region", "Ukrinform",
+     "EUROPE", None, None),
+    (23, "Ukrainian drones hit Afipsky, Ilsky refineries", "Rus. MoD",
+     "EUROPE", None, None),
+    (24, "Zelensky: positions strong near Dobropillia", "Independent",
+     "EUROPE", None, None),
+    (25, "EU approves e-declaration for posted workers", "EU Council",
+     "EUROPE", None, None),
+    (26, "EU deal on methane regulation amendments", "EU Council",
+     "EUROPE", None, None),
+    (27, "EU adopts cross-border protection for adults", "EU Council",
+     "EUROPE", None, None),
+    (28, "EU signs off chemicals simplification law", "EU Council",
+     "EUROPE", None, None),
+    (29, "Swiss bankers seek changes to banking overhaul", "Reuters",
+     "EUROPE", None, None),
+    (30, "Bucharest Security Conference 2026 announced", "SNSPA",
+     "MIDEAST", None, None),
+    (31, "Qatar warns Gulf escalation threatens talks", "Anadolu",
+     "MIDEAST", None, None),
+    (32, "Brent about $92, WTI about $82 on the day", "CaixaBank",
+     "MIDEAST", None, None),
+    (33, "Nvidia slips 3% despite revenue up 103%", "TRW News",
+     "AMERICAS", None, None),
+    (34, "Bitcoin trades near $62,500", "TRW News",
+     "AMERICAS", None, None),
+    (35, "IEA World Energy Outlook 2026 released", "OCI advisory",
+     "CLIMATE", None, None),
+    (36, "Global South youth demonstrate inside COP31", "Africa Sust.",
+     "AFRICA", None, None),
+    (37, "COP31 draft seeks $120bn adaptation finance", "Antalya reports",
+     "CLIMATE", None, None),
+    (38, "75 countries back Turkiye '35 by 35' power goal", "Reuters",
+     "MIDEAST", None, None),
+    (39, "PostgreSQL 19 GA slips to 19 Nov via RC2", "PostgreSQL",
+     "TECH", None, None),
+    (40, "India v New Zealand first Test opens, Wellington", "Indian sports",
+     "TECH", None, None),
+    (41, "Sindhu back in world top five; Sen into top 10", "Indian sports",
+     "TECH", None, None),
+    (42, "Vaishali wins by forfeit at Total Chess", "Indian sports",
+     "TECH", None, None),
+    (43, "Rockets 119, Pacers 104 - Durant scores 21", "Reuters",
+     "AMERICAS", None, None),
+    (44, "Nuggets 105, Celtics 101; Jazz 109, Lakers 97", "Reuters",
+     "AMERICAS", None, None),
+    (45, "Mavericks 116, Warriors 94; Bulls 137, Nets 107", "Reuters",
+     "AMERICAS", None, None),
+    (46, "Grizzlies 124, Cavaliers 121; 76ers 121, Magic 115", "Reuters",
+     "AMERICAS", None, None),
+    (47, "Wizards 103, Raptors 99", "Reuters",
+     "AMERICAS", None, None),
+    (48, "Nigeria NGX falls a second day; Aradel -10%", "TRW News",
+     "AFRICA", None, None),
+    (49, "India signs defence deals with Israel, Japan", "Indian reports",
+     "ASIA", None, None),
+    (50, "Goldman Sachs upgrades India to overweight", "Indian reports",
+     "ASIA", None, None),
+    (51, "Delhi-NCR schools reopen as GRAP-III lifted", "Indian reports",
+     "ASIA", None, None),
+    (52, "ICJ: Myanmar blocked probes, refused evidence", "BBC",
+     "EUROPE", None, None),
+]
+
+REGIONS = [
+    ("AMERICAS", "The Americas"),
+    ("EUROPE", "Europe"),
+    ("MIDEAST", "Middle East"),
+    ("AFRICA", "Africa"),
+    ("ASIA", "Asia"),
+    ("CLIMATE", "Climate & Energy"),
+    ("TECH", "Oceania & Tech"),
+]
+
+TIMELINE = [
+    ("01:58", "UNHCR halts Malaysia registration"),
+    ("04:50", "Indonesia passes asset forfeiture law"),
+    ("09:18", "Swiss bankers seek overhaul changes"),
+    ("09:28", "Ethiopian Airlines breach probe"),
+    ("10:17", "IG Metall calls 24h strikes"),
+    ("14:00", "PHP critical security release"),
+]
+
+NUMBERS = [
+    ("10,000", "Rohingya killed, court finds"),
+    ("815,000", "targeted in 2017, ICJ"),
+    ("$83", "Anthropic IPO price"),
+    ("184", "drones Russia says downed"),
+    ("29", "Kyiv-region homes damaged"),
+    ("$120bn", "adaptation finance sought"),
+    ("75", "countries back '35 by 35'"),
+    ("24h", "IG Metall strike call"),
+]
+
+MARKETS = ("Markets on the day: Brent ~$92 - WTI ~$82 - Bitcoin ~$62,500 - "
+           "Nvidia -3% on revenue +103% - Wall Street's fifth straight loss - "
+           "Nigeria's NGX down a second day")
+
+LEFT_OUT = [
+    "Voyager 1 reached one light-day from Earth on 18 Nov - yesterday's milestone.",
+    "Iran's strikes on Kuwait and Bahrain, and the US strike on Qeshm, were 17-18 Nov.",
+    "Peltola's Alaska Senate win was called on 18 Nov - yesterday.",
+    "Jensen Huang's Nvidia exit dates to 12-13 Nov; only the earnings reaction is today's.",
+    "A reported Russian plane crash in Siberia (19 dead) is unconfirmed - excluded.",
+]
+
+# continent polygons as (lon, lat) outlines for the dot-matrix map
+LAND = [
+    [(-168, 66), (-140, 70), (-125, 71), (-110, 68), (-95, 69), (-85, 66),
+     (-80, 62), (-78, 58), (-85, 55), (-90, 50), (-85, 47), (-76, 44),
+     (-70, 42), (-74, 38), (-76, 34), (-80, 30), (-81, 25), (-84, 29),
+     (-90, 28), (-97, 26), (-97, 22), (-94, 18), (-90, 15), (-83, 9),
+     (-79, 9), (-77, 4), (-80, 0), (-81, -4), (-77, -12), (-70, -18),
+     (-70, -24), (-70, -32), (-72, -40), (-74, -48), (-72, -54), (-66, -55),
+     (-68, -50), (-65, -42), (-62, -35), (-52, -28), (-41, -20), (-35, -8),
+     (-38, -4), (-44, 0), (-50, 4), (-58, 7), (-64, 10), (-70, 12),
+     (-75, 10), (-80, 8), (-85, 12), (-90, 14), (-95, 16), (-102, 18),
+     (-105, 22), (-110, 24), (-114, 29), (-120, 34), (-124, 42), (-124, 48),
+     (-130, 55), (-140, 60), (-155, 59), (-165, 60)],
+    [(-9, 43), (-2, 44), (0, 46), (-5, 48), (-1, 50), (2, 51), (5, 53),
+     (8, 55), (8, 57), (12, 56), (18, 56), (21, 55), (24, 58), (28, 60),
+     (30, 62), (28, 66), (32, 70), (45, 68), (60, 69), (75, 72), (90, 74),
+     (105, 77), (120, 73), (135, 72), (150, 70), (162, 66), (170, 66),
+     (178, 65), (170, 60), (158, 52), (142, 50), (138, 44), (132, 43),
+     (128, 40), (122, 38), (120, 34), (121, 30), (118, 25), (110, 20),
+     (108, 14), (106, 8), (103, 5), (100, 8), (98, 14), (94, 17), (91, 22),
+     (88, 21), (86, 19), (80, 14), (77, 8), (73, 18), (70, 22), (66, 25),
+     (61, 25), (57, 27), (52, 28), (50, 29), (48, 30), (50, 26), (55, 24),
+     (58, 23), (55, 20), (52, 16), (48, 14), (44, 12), (43, 15), (40, 20),
+     (38, 24), (36, 28), (34, 31), (30, 31), (26, 32), (22, 33), (18, 33),
+     (12, 34), (10, 34), (10, 37), (8, 39), (4, 40), (0, 39), (-2, 37),
+     (-6, 36), (-9, 37), (-9, 43)],
+    [(-17, 15), (-10, 14), (-5, 10), (2, 6), (6, 4), (9, 4), (13, -2),
+     (12, -10), (14, -18), (16, -26), (18, -32), (26, -34), (32, -28),
+     (35, -22), (36, -16), (38, -10), (40, -4), (42, 2), (48, 8), (51, 11),
+     (44, 11), (40, 15), (38, 20), (36, 24), (34, 28), (32, 31), (30, 31),
+     (24, 32), (18, 33), (12, 34), (6, 34), (0, 35), (-6, 35), (-10, 31),
+     (-14, 24), (-17, 20), (-17, 15)],
+    [(95, 5), (100, 6), (104, 8), (107, 12), (110, 16), (114, 20),
+     (118, 24), (121, 28), (126, 34), (130, 38), (134, 42), (138, 44),
+     (141, 46), (141, 50), (138, 46), (134, 44), (130, 42), (126, 40),
+     (122, 36), (120, 32), (118, 28), (114, 22), (110, 18), (106, 12),
+     (102, 8), (98, 6), (95, 5)],
+    [(112, -11), (114, -18), (113, -24), (115, -32), (118, -35), (124, -33),
+     (130, -32), (134, -33), (137, -35), (140, -38), (144, -38), (147, -38),
+     (150, -37), (153, -30), (153, -24), (151, -18), (146, -14), (142, -11),
+     (141, -14), (139, -18), (136, -22), (135, -26), (133, -30), (130, -32),
+     (126, -33), (120, -34), (116, -34), (114, -28), (113, -20), (112, -14),
+     (112, -11)],
+    [(166, -46), (170, -44), (173, -41), (176, -38), (178, -37), (175, -40),
+     (172, -43), (168, -46), (166, -46)],
+]
 
 
-def text_w(s, scale):
-    return len(s) * 6 * scale - scale
-
-
-def draw_text(cv, x, y, s, col, scale=1, bold=False):
-    for ch in s.upper():
-        glyph = FONT.get(ch, FONT[" "])
-        for row in range(7):
-            bits = glyph[row]
-            for b in range(5):
-                if bits & (1 << (4 - b)):
-                    cv.rect(x + b * scale, y + row * scale, scale, scale, col)
-                    if bold:
-                        cv.rect(x + b * scale + scale, y + row * scale,
-                                scale, scale, col)
-        x += 6 * scale + (scale if bold else 0)
-    return x
-
-
-def wrap(s, max_chars):
-    lines, cur = [], ""
-    for word in s.split():
-        if len(cur) + (1 if cur else 0) + len(word) <= max_chars:
-            cur = cur + (" " if cur else "") + word
+# ---------------------------------------------------------------- drawing
+def wrap(draw, text, fnt, width):
+    words, lines, cur = text.split(), [], ""
+    for w_ in words:
+        trial = (cur + " " + w_).strip()
+        if draw.textlength(trial, font=fnt) <= width:
+            cur = trial
         else:
             if cur:
                 lines.append(cur)
-            cur = word
+            cur = w_
     if cur:
         lines.append(cur)
     return lines
 
 
-def draw_block(cv, x, y, s, col, scale, max_chars, line_h, bold=False,
-               max_lines=None):
-    lines = wrap(s, max_chars)
-    if max_lines:
-        lines = lines[:max_lines]
-    for ln in lines:
-        draw_text(cv, x, y, ln, col, scale, bold)
-        y += line_h
-    return y
+def fit_lines(draw, text, path, width, start, min_size, max_lines):
+    size = start
+    while size > min_size:
+        fnt = font(path, size)
+        lines = wrap(draw, text, fnt, width)
+        if len(lines) <= max_lines:
+            return fnt, lines
+        size -= 1
+    fnt = font(path, min_size)
+    return fnt, wrap(draw, text, fnt, width)[:max_lines]
 
 
-# ---------------------------------------------------------------- palette
-PAPER = (247, 243, 234)
-INK = (18, 24, 38)
-FAINT = (90, 96, 110)
-RED = (178, 34, 40)
-BLUE = (27, 73, 128)
-TEAL = (10, 110, 108)
-GOLD = (176, 124, 18)
-GREEN = (46, 110, 52)
-PURPLE = (96, 52, 140)
-SLATE = (62, 72, 88)
-ORANGE = (196, 96, 20)
-WHITE = (255, 255, 255)
-SKY = (214, 228, 240)
-SAND = (238, 226, 196)
-PALE = (233, 228, 214)
-
-REGION_COL = {
-    "ASIA-PACIFIC": TEAL, "EUROPE": BLUE, "MIDDLE EAST": GOLD,
-    "NORTH AMERICA": RED, "AFRICA": GREEN, "LATIN AMERICA": PURPLE,
-    "CLIMATE": GREEN, "WORLD COURT": SLATE, "MARKETS": SLATE,
-    "TECH": SLATE, "CULTURE": PURPLE, "SPORT": ORANGE,
-}
-
-# ------------------------------------------------------------- world map
-# Dot-matrix world map, 92 x 42 cells. LAND[row] lists (first, last) land
-# cell spans for that row, sketched from the standard world outline.
-LAND = {
-    1: [(35, 39)],
-    2: [(14, 16), (20, 24), (34, 40), (48, 48), (60, 63), (70, 75)],
-    3: [(4, 8), (12, 18), (22, 26), (33, 41), (55, 62), (68, 76), (82, 90)],
-    4: [(3, 10), (11, 30), (34, 40), (47, 52), (53, 91)],
-    5: [(3, 11), (11, 31), (35, 39), (41, 41), (47, 53), (54, 91)],
-    6: [(4, 10), (12, 32), (37, 38), (44, 45), (47, 53), (54, 90)],
-    7: [(12, 33), (44, 46), (47, 55), (56, 89)],
-    8: [(13, 33), (44, 46), (45, 57), (58, 88)],
-    9: [(13, 32), (44, 58), (59, 87)],
-    10: [(13, 31), (44, 58), (63, 79), (81, 83)],
-    11: [(13, 30), (43, 46), (48, 50), (51, 59), (60, 70), (71, 82), (80, 83)],
-    12: [(13, 30), (43, 58), (55, 62), (60, 66), (64, 69), (70, 81), (80, 82)],
-    13: [(14, 28), (42, 59), (55, 60), (64, 69), (72, 79)],
-    14: [(15, 23), (42, 59), (56, 60), (64, 68), (70, 74), (76, 78)],
-    15: [(16, 22), (42, 58), (57, 60), (64, 68), (70, 74), (76, 78)],
-    16: [(20, 24), (43, 57), (65, 67), (70, 73), (77, 77)],
-    17: [(25, 30), (43, 57), (65, 66), (70, 73)],
-    18: [(26, 33), (44, 56), (69, 72)],
-    19: [(26, 35), (45, 56), (69, 74), (77, 80)],
-    20: [(27, 36), (46, 56), (70, 76), (79, 82)],
-    21: [(27, 36), (46, 57), (71, 78), (81, 84)],
-    22: [(27, 35), (47, 57), (82, 86)],
-    23: [(28, 34), (48, 57), (76, 79), (82, 84)],
-    24: [(28, 34), (48, 57), (57, 59), (75, 85)],
-    25: [(28, 33), (49, 56), (57, 58), (75, 86)],
-    26: [(28, 32), (49, 56), (57, 58), (75, 86)],
-    27: [(28, 31), (50, 55), (76, 85)],
-    28: [(28, 30), (50, 54), (77, 84)],
-    29: [(28, 30), (80, 84)],
-    30: [(28, 29)],
-    31: [(28, 29), (89, 90)],
-    32: [(28, 28), (88, 89)],
-    33: [(28, 28)],
-}
-MAP_COLS, MAP_ROWS, CELL = 92, 42, 4
-
-
-def draw_map(cv, x, y):
-    cv.rect(x - 6, y - 6, MAP_COLS * CELL + 12, MAP_ROWS * CELL + 12, SKY)
-    for row, spans in LAND.items():
-        for a, b in spans:
-            for c in range(a, b + 1):
-                cv.circle(x + c * CELL + 1, y + row * CELL + 1, 1,
-                          (120, 148, 108))
-    return x, y
-
-
-def pin_xy(x, y, lat, lon):
-    return (x + int((lon + 180) / 360 * MAP_COLS * CELL),
-            y + int((90 - lat) / 180 * MAP_ROWS * CELL))
-
-
-# story number -> (lat, lon) for the map pins
-PINS = {
-    1: (22.5, 114.1), 2: (52.1, 4.3), 3: (44.9, 34.1), 4: (51.1, 6.9),
-    5: (14.7, -17.3), 6: (36.9, 30.7), 7: (40.7, -74.0), 8: (41.5, -73.0),
-    9: (27.0, -81.0), 10: (43.0, -87.9), 11: (23.8, 90.4),
-    12: (24.6, 46.7), 13: (10.5, -66.9), 14: (3.1, 101.7),
-    15: (-6.2, 106.8), 16: (9.0, 38.7), 17: (51.5, 0.0),
-}
-
-
-# ---------------------------------------------------------------- content
-# Every story below was reported on Thursday 19 November 2026 by the
-# outlet credited on the page. See SOURCES.md for the full mapping.
-LEAD = {
-    "n": 1, "region": "ASIA-PACIFIC", "place": "SHENZHEN, CHINA",
-    "head": "TRUMP, XI AND PUTIN HOLD FIRST-EVER THREE-WAY SUMMIT",
-    "body": ("The presidents of the United States, China and Russia met for "
-             "90 minutes on the sidelines of the APEC summit in Shenzhen - "
-             "the first trilateral talks between the three powers. Ukraine, "
-             "the Iran war, nuclear weapons, trade and artificial "
-             "intelligence were all on the table. The joint statement that "
-             "followed promised only cooperation on trade, technology and "
-             "economic growth: pledges, not breakthroughs. Putin said all "
-             "three shared an interest in resolving the war in Ukraine. "
-             "Trump called Xi his friend."),
-    "credit": "USA TODAY / AJU PRESS",
-    "proof": "PROOF: ON THE RECORD AT APEC - SHENZHEN, 19 NOV",
-}
-
-# (number, region, place, headline, body, credit, art-key)
-FEATURES = [
-    (2, "WORLD COURT", "THE HAGUE",
-     "WORLD COURT DELIVERS JUDGMENT IN ROHINGYA GENOCIDE CASE",
-     "ICJ judgment in The Gambia v. Myanmar: 10,000 Rohingya killed "
-     "in 2017, 815,000 targeted, systematic hate speech.",
-     "REUTERS LIVE / TBS", "court"),
-    (3, "EUROPE", "CRIMEA - BERLIN",
-     "CRIMEA BRIDGE HIT A THIRD TIME; ALLIES GATHER IN BERLIN",
-     "Traffic on the 19-km bridge was suspended after a third Ukrainian "
-     "attack this week. In Berlin, Ukraine's backers met in a show of "
-     "support.",
-     "THE INDEPENDENT / REUTERS", "bridge"),
-    (4, "EUROPE", "GERMANY",
-     "IG METALL CALLS 24-HOUR STRIKES AT CAR AND STEEL PLANTS",
-     "Germany's largest union called Friday walkouts at hundreds of "
-     "auto and steel firms in a pay fight covering 3.7 million workers. "
-     "It wants 5%.",
-     "REUTERS", "factory"),
-    (5, "AFRICA", "SENEGAL",
-     "DOZENS MISSING AS MIGRANT BOAT CAPSIZES OFF SENEGAL",
-     "A boat with about 50 Europe-bound migrants capsized off Yenne, "
-     "south of Dakar; dozens missing. 8,200 reached the Canaries in 12 "
-     "days.",
-     "REUTERS", "boat"),
-    (6, "CLIMATE", "ANTALYA, TURKIYE",
-     "COP31 ENTERS ITS FINAL STRETCH, DIVIDED OVER FOSSIL FUELS",
-     "A new draft decision was due Thursday, with the fossil-fuel "
-     "phase-out wording, adaptation money and transition finance "
-     "unresolved.",
-     "REUTERS / OCI", "sun"),
-    (7, "MARKETS", "NEW YORK",
-     "HAWKISH FED MINUTES; WALL STREET SLIPS A FIFTH DAY",
-     "Minutes showed October's hold was a close call; nearly all "
-     "officials expect more hikes. Gold fell 3% to $3,725.",
-     "CAIXABANK RESEARCH", "chart"),
-    (8, "TECH", "NEW YORK",
-     "ANTHROPIC MAKES ITS NASDAQ DEBUT, PRICED AT $83",
-     "The AI lab's shares were set to open on Nasdaq as ANT after an "
-     "IPO priced at $83 - reported to raise about $90 billion, the "
-     "largest debut ever.",
-     "IC / NORDFX", "bell"),
-    (9, "CULTURE", "WORLDWIDE",
-     "GTA VI LAUNCH DAY: VICE CITY OPENS AT MIDNIGHT",
-     "Grand Theft Auto VI went on sale for PS5 and Xbox Series X|S, "
-     "unlocking at midnight per time zone after two delays. Download: "
-     "some 212 GB.",
-     "ROCKSTAR / PRESS REPORTS", "palm"),
-    (10, "SPORT", "MIAMI",
-     "GIANNIS SINKS HIS OLD TEAM AS HEAT BEAT BUCKS 137-130",
-     "Facing Milwaukee since his July trade, Antetokounmpo posted "
-     "27 points, 13 rebounds, 9 assists. Bucks: 11 straight losses.",
-     "REUTERS / FIELD LEVEL MEDIA", "ball"),
-    (11, "ASIA-PACIFIC", "DHAKA",
-     "BANGLADESH ON LOCKDOWN AS UNREST OVER HASINA FLARES",
-     "Security stepped up nationwide for a lockdown day called by "
-     "supporters of ex-PM Sheikh Hasina after weeks of arson attacks.",
-     "THE DAILY STAR / REUTERS", "shield"),
-    (12, "MIDDLE EAST", "RIYADH",
-     "SAUDI-LED COALITION REPELS HOUTHI MISSILES AIMED AT RIYADH",
-     "The coalition said it turned back Houthi missiles fired toward "
-     "Riyadh, a day after Iran struck US bases in the Gulf.",
-     "AL JAZEERA", "missile"),
-    (13, "LATIN AMERICA", "AT COP31",
-     "VENEZUELA PITCHES AI AS ITS PATH TO 'CLEANER OIL'",
-     "Venezuela's AI-and-hydrocarbons minister: AI will monitor "
-     "methane leaks while output rises to 1.5M barrels a day.",
-     "REUTERS", "pump"),
-    (14, "ASIA-PACIFIC", "KUALA LUMPUR",
-     "UNHCR HALTS REFUGEE REGISTRATION IN MALAYSIA",
-     "The UN refugee agency stopped registering asylum seekers after "
-     "Malaysia decided to build its own system. Most of those affected "
-     "are Rohingya from Myanmar; UNHCR says it backs the transition.",
-     "REUTERS", "tent"),
-    (15, "ASIA-PACIFIC", "JAKARTA",
-     "INDONESIA PASSES ASSET-FORFEITURE LAW",
-     "Parliament approved seizing assets tied to corruption and other "
-     "crimes without first securing a conviction, for holdings worth at "
-     "least 1 billion rupiah (about $54,885), in a plenary vote held on "
-     "Thursday.",
-     "REUTERS", "gavel"),
-    (16, "AFRICA", "ADDIS ABABA",
-     "ETHIOPIAN AIRLINES PROBES LOYALTY-PROGRAMME BREACH",
-     "Africa's biggest airline is investigating a cyber incident that "
-     "hit ShebaMiles, its loyalty scheme with 5.38 million members. "
-     "Flights were not disrupted; the scale of the breach is not yet "
-     "clear.",
-     "REUTERS", "plane"),
-    (17, "TECH", "WORLDWIDE",
-     "PHP ISSUES CRITICAL SECURITY RELEASE FOR ALL VERSIONS",
-     "The PHP team shipped emergency fixes in a 14:00-14:30 UTC window "
-     "for every supported branch. The worst flaws are rated CRITICAL, "
-     "though they need non-default setups; administrators were urged "
-     "to patch at once.",
-     "PHP.NET", "server"),
-]
-
-BRIEFS = [
-    (18, "TRUMP-XI WORKING LUNCH OPENS SUMMIT DAY IN SHENZHEN (AFP)"),
-    (19, "APEC'S 21 ECONOMIES MEET: 'PROSPER TOGETHER' (DIPLOMATIC WATCH)"),
-    (20, "PUTIN: ALL THREE SHARE INTEREST IN ENDING UKRAINE WAR (USA TODAY)"),
-    (21, "MUSK TRAVELS WITH TRUMP TO CHINA, SITS OUT THE TALKS (OFFICIALS)"),
-    (22, "RUSSIAN DRONES DAMAGE 29 HOMES, ENERGY SITE IN KYIV REGION (UKRINFORM)"),
-    (23, "UKRAINE DRONES HIT 2 RUSSIAN REFINERIES; 184 DOWNED CLAIMED (MOD)"),
-    (24, "ZELENSKY: FRONT POSITIONS STRONG IN DONETSK REGION (INDEPENDENT)"),
-    (25, "EU APPROVES E-DECLARATION FOR POSTED WORKERS (EU COUNCIL)"),
-    (26, "EU PROVISIONAL DEAL TO AMEND METHANE RULES (EU COUNCIL)"),
-    (27, "EU ADOPTS CROSS-BORDER ADULT-PROTECTION RULES (EU COUNCIL)"),
-    (28, "EU SIGNS OFF SIMPLER CHEMICALS LAW (EU COUNCIL)"),
-    (29, "SWISS BANKERS: BANKING OVERHAUL GOES TOO FAR (REUTERS)"),
-    (30, "BUCHAREST CONFERENCE TO TACKLE NATO-FLANK HYBRID THREATS (SNSPA)"),
-    (31, "QATAR WARNS GULF ESCALATION COULD DERAIL TALKS (ANADOLU)"),
-    (32, "BRENT NEAR $92, WTI $82 AS SURPLUS WEIGHS (CAIXABANK)"),
-    (33, "NVIDIA -3% DESPITE REVENUE GROWTH OF 103% (TRW WIRE)"),
-    (34, "BITCOIN NEAR $62,500 AS RISK APPETITE COOLS (TRW WIRE)"),
-    (35, "IEA WORLD ENERGY OUTLOOK 2026 PUBLISHED (OCI)"),
-    (36, "GLOBAL SOUTH YOUTH DEMONSTRATE INSIDE COP31 (ASM)"),
-    (37, "COP31 DRAFT SEEKS $120BN+ FOR ADAPTATION (ANTALYA REPORTS)"),
-    (38, "75 COUNTRIES BACK TURKIYE 35-BY-35 POWER PLEDGE (REUTERS)"),
-    (39, "POSTGRESQL 19 REACHES GENERAL AVAILABILITY (RELEASE TEAM)"),
-    (40, "INDIA-NEW ZEALAND FIRST TEST OPENS IN WELLINGTON (INDIAN REPORTS)"),
-    (41, "SINDHU BACK IN WORLD TOP FIVE; SEN IN TOP TEN (INDIAN REPORTS)"),
-    (42, "VAISHALI WINS BY FORFEIT AT TOTAL CHESS (INDIAN REPORTS)"),
-    (43, "ROCKETS 119, PACERS 104 - DURANT 21 (REUTERS/FLM)"),
-    (44, "NUGGETS 105, CELTICS 101; JAZZ 109, LAKERS 97 (FLM)"),
-    (45, "MAVERICKS 116, WARRIORS 94; BULLS 137, NETS 107 (FLM)"),
-    (46, "GRIZZLIES 124, CAVS 121; 76ERS 121, MAGIC 115 (FLM)"),
-    (47, "WIZARDS 103, RAPTORS 99 (REUTERS/FLM)"),
-    (48, "NIGERIA NGX FALLS AGAIN; ARADEL -10% (TRW WIRE)"),
-    (49, "INDIA SEALS DEFENCE DEALS WITH ISRAEL, JAPAN (INDIAN REPORTS)"),
-    (50, "GOLDMAN UPGRADES INDIA TO OVERWEIGHT (INDIAN REPORTS)"),
-    (51, "DELHI-NCR SCHOOLS REOPEN; GRAP-III LIFTED (INDIAN REPORTS)"),
-    (52, "ICJ: MYANMAR FAILED TO INVESTIGATE ATROCITIES (BBC VIA TBS)"),
-]
-
-TIMELINE = [
-    "00:00 LOCAL - GTA VI UNLOCKS WORLDWIDE",
-    "01:58 - UNHCR HALTS MALAYSIA REGISTRATION",
-    "04:45 - TRUMP-XI WORKING LUNCH, SHENZHEN",
-    "04:50 - INDONESIA FORFEITURE LAW PASSES",
-    "06:30 - TRUMP-XI-PUTIN THREE-WAY TALKS OPEN",
-    "09:00 - ICJ READS ROHINGYA JUDGMENT, THE HAGUE",
-    "09:28 - ETHIOPIAN BREACH PROBE",
-    "10:17 - IG METALL CALLS STRIKES",
-    "14:00 - PHP CRITICAL RELEASE",
-    "14:30 - ANTHROPIC OPENS ON NASDAQ",
-]
-
-NUMBERS = [
-    ("90 MIN", "THE SHENZHEN THREE-WAY TALKS"),
-    ("3.7M", "WORKERS IN IG METALL'S PAY FIGHT"),
-    ("10,000", "ROHINGYA KILLED IN 2017 - ICJ"),
-    ("815,000", "ROHINGYA TARGETED - ICJ"),
-    ("8,200", "CANARY ISLAND ARRIVALS IN 12 DAYS"),
-    ("5.38M", "LOYALTY MEMBERS IN THE BREACH PROBE"),
-    ("$83", "ANTHROPIC'S IPO PRICE PER SHARE"),
-    ("19 KM", "THE CRIMEA BRIDGE, EUROPE'S LONGEST"),
-]
-
-WEATHER = [
-    "CYCLONE AKVAN: ODISHA SHUTS SCHOOLS AND THE RAILWAYS LEAD "
-    "PREPAREDNESS AS THE STORM NEARS (INDIAN REPORTS)",
-    "WEST AFRICA ROUTE: NEARLY 600 PEOPLE DEAD OR MISSING AT SEA IN "
-    "2026 (UNHCR VIA REUTERS)",
-    "KYIV REGION: AN ENERGY FACILITY IS HIT AS THE WINTER FRONT "
-    "NEARS (UKRINFORM)",
-]
-
-LEFT_OUT = [
-    "VOYAGER 1 HIT ONE LIGHT-DAY FROM EARTH ON NOV 18 (NASA) - "
-    "YESTERDAY'S MILESTONE.",
-    "IRAN-US GULF STRIKES WERE NOV 17-18 (WSJ/REUTERS) - IN THE "
-    "NOV 18 EDITION.",
-    "PELTOLA'S ALASKA WIN WAS CALLED NOV 18 (AP) - YESTERDAY'S NEWS.",
-    "SIBERIA PLANE-CRASH REPORT UNCONFIRMED BY ANY WIRE - NOT "
-    "PRINTED.",
-]
-
-
-# ------------------------------------------------------------ illustrations
-def art_lead(cv, x, y, w, h):
-    """Shenzhen skyline under the three leaders' flags."""
-    cv.rect(x, y, w, h, (198, 216, 232))
-    cv.circle(x + w - 42, y + 22, 13, GOLD)
-    base = y + h
-    heights = [38, 62, 47, 78, 55, 88, 66, 44, 72, 52, 84, 40]
-    bx = x + 4
-    for i, bh in enumerate(heights):
-        bw = (w - 8) // len(heights)
-        cv.rect(bx, base - bh, bw - 3, bh, (52, 68, 96))
-        for wy in range(base - bh + 6, base - 6, 9):
-            cv.rect(bx + 3, wy, 3, 3, (250, 220, 130))
-        bx += bw
-    cv.rect(x, base - 2, w, 2, INK)
-    fy = y + 8
-    for i, kind in enumerate(["us", "cn", "ru"]):
-        fx = x + 26 + i * 52
-        cv.line(fx, fy, fx, fy + 44, INK, 2)
-        if kind == "us":
-            for s in range(4):
-                cv.rect(fx + 2, fy + s * 5, 26, 3,
-                        RED if s % 2 == 0 else WHITE)
-            cv.rect(fx + 2, fy, 12, 9, BLUE)
-        elif kind == "cn":
-            cv.rect(fx + 2, fy, 26, 19, RED)
-            cv.circle(fx + 8, fy + 6, 3, GOLD)
-            cv.circle(fx + 15, fy + 4, 1, GOLD)
-            cv.circle(fx + 16, fy + 9, 1, GOLD)
-        else:
-            cv.rect(fx + 2, fy, 26, 6, WHITE)
-            cv.rect(fx + 2, fy + 6, 26, 6, BLUE)
-            cv.rect(fx + 2, fy + 12, 26, 7, RED)
-
-
-def art_court(cv, x, y, w, h):
-    cx = x + w // 2
-    cv.poly([(cx - 44, y + 14), (cx + 44, y + 14), (cx, y + 2)], SLATE)
-    cv.rect(x + 8, y + 16, w - 16, 4, SLATE)
-    for i in range(4):
-        cv.rect(x + 14 + i * ((w - 28) // 3), y + 22, 6, h - 32, SLATE)
-    cv.rect(x + 8, y + h - 10, w - 16, 4, SLATE)
-    cv.rect(x + 4, y + h - 5, w - 8, 3, INK)
-    cv.line(cx - 16, y + 24, cx + 16, y + 24, GOLD, 2)
-    cv.line(cx - 16, y + 24, cx - 16, y + 30, GOLD, 2)
-    cv.line(cx + 16, y + 24, cx + 16, y + 30, GOLD, 2)
-    cv.poly([(cx - 22, y + 38), (cx - 10, y + 38), (cx - 16, y + 30)], GOLD)
-    cv.poly([(cx + 10, y + 38), (cx + 22, y + 38), (cx + 16, y + 30)], GOLD)
-
-
-def art_bridge(cv, x, y, w, h):
-    wy = y + h - 14
-    for i in range(6):
-        cv.line(x + 6 + i * (w // 6), wy + 6, x + 16 + i * (w // 6),
-                wy + 6, BLUE, 2)
-    cv.rect(x + 6, y + 26, w - 12, 4, SLATE)
-    for tx in (x + w // 3, x + 2 * w // 3):
-        cv.rect(tx, y + 8, 4, 22, SLATE)
-        cv.line(tx + 2, y + 8, x + 8, y + 26, SLATE, 1)
-        cv.line(tx + 2, y + 8, x + w - 8, y + 26, SLATE, 1)
-    bx, by = x + w // 2, y + 24
-    for dx, dy in ((-10, 0), (10, 0), (0, -9), (0, 9), (-7, -7), (7, -7),
-                   (-7, 7), (7, 7)):
-        cv.line(bx, by, bx + dx, by + dy, ORANGE, 2)
-    cv.circle(bx, by, 4, GOLD)
-
-
-def art_factory(cv, x, y, w, h):
-    base = y + h - 4
-    cv.rect(x + 8, base - 26, w - 40, 26, SLATE)
-    cv.poly([(x + 8, base - 26), (x + 26, base - 38), (x + 44, base - 26)],
-            SLATE)
-    cv.rect(x + w - 30, base - 48, 8, 48, SLATE)
-    cv.rect(x + w - 44, base - 40, 7, 40, SLATE)
-    for i in range(3):
-        cv.circle(x + w - 26 + i * 5, base - 52 - i * 4, 4 - i // 2,
-                  (200, 200, 205))
-    cv.circle(x + 24, base - 14, 9, GOLD, fill=False)
-    for a in range(8):
-        import math
-        gx = x + 24 + int(11 * math.cos(a * 0.785))
-        gy = base - 14 + int(11 * math.sin(a * 0.785))
-        cv.rect(gx - 1, gy - 1, 3, 3, GOLD)
-    for i in range(3):
-        sx = x + w // 2 + i * 16
-        cv.line(sx, base, sx, base - 20, RED, 2)
-        cv.rect(sx - 5, base - 30, 12, 9, RED)
-
-
-def art_boat(cv, x, y, w, h):
-    cv.circle(x + w - 20, y + 12, 7, GOLD)
-    cv.circle(x + w - 24, y + 10, 6, PAPER)
-    wy = y + h - 16
-    cv.poly([(x + 12, wy), (x + w - 12, wy), (x + w - 24, wy + 9),
-             (x + 24, wy + 9)], (120, 66, 30))
-    cv.line(x + w // 2, wy, x + w // 2, wy - 30, INK, 2)
-    cv.poly([(x + w // 2 + 2, wy - 30), (x + w // 2 + 2, wy - 4),
-             (x + w // 2 + 20, wy - 4)], (240, 240, 235))
-    for i in range(5):
-        cv.line(x + 6 + i * (w // 5), wy + 13, x + 16 + i * (w // 5),
-                wy + 13, BLUE, 2)
-    for i in range(4):
-        cv.circle(x + 26 + i * 14, wy - 3, 3, INK)
-
-
-def art_sun(cv, x, y, w, h):
-    cx, cy = x + 30, y + 24
-    cv.circle(cx, cy, 12, GOLD)
-    for a in range(8):
-        import math
-        cv.line(cx + int(15 * math.cos(a * 0.785)),
-                cy + int(15 * math.sin(a * 0.785)),
-                cx + int(20 * math.cos(a * 0.785)),
-                cy + int(20 * math.sin(a * 0.785)), GOLD, 2)
-    cv.poly([(x + 58, y + 40), (x + 78, y + 12), (x + 92, y + 38),
-             (x + 76, y + 46)], GREEN)
-    cv.line(x + 62, y + 40, x + 88, y + 16, GREEN, 1)
-    tx = x + w - 18
-    cv.rect(tx, y + 8, 5, 30, RED)
-    cv.circle(tx + 2, y + 42, 6, RED)
-    cv.rect(tx + 1, y + 20, 3, 18, WHITE)
-
-
-def art_chart(cv, x, y, w, h):
-    cv.line(x + 8, y + 6, x + 8, y + h - 10, FAINT, 1)
-    cv.line(x + 8, y + h - 10, x + w - 6, y + h - 10, FAINT, 1)
-    pts = [(x + 10, y + 12), (x + 30, y + 18), (x + 48, y + 14),
-           (x + 66, y + 26), (x + 84, y + 30), (x + w - 12, y + 40)]
-    for i in range(len(pts) - 1):
-        cv.line(pts[i][0], pts[i][1], pts[i + 1][0], pts[i + 1][1], RED, 2)
-    cv.poly([(x + w - 12, y + 46), (x + w - 20, y + 34),
-             (x + w - 4, y + 34)], RED)
-    for bx, bh in ((x + 16, 12), (x + 34, 18), (x + 52, 10), (x + 70, 20)):
-        cv.rect(bx, y + h - 10 - bh, 8, bh, SLATE)
-
-
-def art_bell(cv, x, y, w, h):
-    cx = x + 30
-    cv.circle(cx, y + 12, 4, GOLD)
-    cv.poly([(cx - 13, y + 34), (cx + 13, y + 34), (cx + 8, y + 16),
-             (cx - 8, y + 16)], GOLD)
-    cv.rect(cx - 16, y + 34, 32, 4, GOLD)
-    cv.circle(cx, y + 42, 4, GOLD)
-    draw_text(cv, x + 56, y + 10, "ANT", INK, 2, bold=True)
-    cv.line(x + 58, y + 40, x + 78, y + 26, GREEN, 2)
-    cv.line(x + 78, y + 26, x + 92, y + 32, GREEN, 2)
-    cv.poly([(x + 92, y + 26), (x + 92, y + 38), (x + 84, y + 30)], GREEN)
-
-
-def art_palm(cv, x, y, w, h):
-    cv.rect(x, y, w, h, (250, 214, 170))
-    cv.circle(x + w - 24, y + 14, 9, (244, 160, 40))
-    tx = x + 26
-    for i in range(9):
-        cv.line(tx + i, y + h - 8 - i * 3, tx + i + 3, y + h - 8 - i * 3,
-                (120, 84, 40), 2)
-    top = (tx + 26, y + h - 36)
-    for dx, dy in ((-20, -8), (-12, -13), (0, -15), (13, -12), (21, -6)):
-        cv.line(top[0], top[1], top[0] + dx, top[1] + dy, GREEN, 2)
-    cv.rect(x + 52, y + h - 20, 44, 10, RED)
-    cv.rect(x + 60, y + h - 27, 26, 8, RED)
-    cv.circle(x + 62, y + h - 9, 5, INK)
-    cv.circle(x + 86, y + h - 9, 5, INK)
-    cv.rect(x + 66, y + h - 25, 12, 5, SKY)
-
-
-def art_ball(cv, x, y, w, h):
-    cx, cy, r = x + 30, y + 26, 19
-    cv.circle(cx, cy, r, ORANGE)
-    cv.circle(cx, cy, r, INK, fill=False)
-    cv.line(cx - r, cy, cx + r, cy, INK, 1)
-    cv.line(cx, cy - r, cx, cy + r, INK, 1)
-    cv.line(cx - 12, cy - 15, cx - 12, cy + 15, INK, 1)
-    cv.line(cx + 12, cy - 15, cx + 12, cy + 15, INK, 1)
-    hx = x + w - 34
-    cv.rect(hx, y + 10, 26, 3, RED)
-    cv.line(hx + 3, y + 13, hx + 6, y + 26, FAINT, 1)
-    cv.line(hx + 12, y + 13, hx + 12, y + 26, FAINT, 1)
-    cv.line(hx + 21, y + 13, hx + 18, y + 26, FAINT, 1)
-    cv.line(hx + 6, y + 26, hx + 18, y + 26, FAINT, 1)
-
-
-def art_shield(cv, x, y, w, h):
-    for i, bh in enumerate((18, 26, 14)):
-        cv.rect(x + 6 + i * 16, y + h - 12 - bh, 11, bh, SLATE)
-    pts = [(x + w - 40, y + 6), (x + w - 14, y + 6), (x + w - 14, y + 26),
-           (x + w - 27, y + 42), (x + w - 40, y + 26)]
-    cv.poly(pts, TEAL)
-    cv.poly([(px + 3, py + 3) for px, py in
-             [(x + w - 38, y + 10), (x + w - 16, y + 10), (x + w - 16,
-              y + 25), (x + w - 27, y + 37), (x + w - 38, y + 25)]],
-            (90, 180, 175))
-    fx, fy = x + 18, y + 16
-    cv.poly([(fx, fy + 12), (fx + 5, fy), (fx + 10, fy + 12),
-             (fx + 5, fy + 16)], ORANGE)
-    cv.poly([(fx + 3, fy + 12), (fx + 5, fy + 5), (fx + 7, fy + 12),
-             (fx + 5, fy + 14)], GOLD)
-
-
-def art_missile(cv, x, y, w, h):
-    for i in range(7):
-        cv.line(x + 10 + i * 5, y + 40 - i * 2, x + 16 + i * 5,
-                y + 38 - i * 2, FAINT, 1)
-    cv.poly([(x + 52, y + 8), (x + 62, y + 14), (x + 46, y + 26),
-             (x + 40, y + 18)], RED)
-    cv.poly([(x + 40, y + 18), (x + 34, y + 24), (x + 42, y + 26)],
-            ORANGE)
-    cv.poly([(x + 66, y + 40), (x + 80, y + 26), (x + 94, y + 40)],
-            TEAL)
-    cv.line(x + 66, y + 40, x + 94, y + 40, TEAL, 2)
-    cv.line(x + 62, y + 20, x + 74, y + 30, GOLD, 2)
-    cv.line(x + 74, y + 20, x + 62, y + 30, GOLD, 2)
-
-
-def art_pump(cv, x, y, w, h):
-    base = y + h - 6
-    cv.line(x + 10, base, x + w - 8, base, INK, 2)
-    cv.poly([(x + 30, base), (x + 40, base - 26), (x + 46, base)],
-            SLATE)
-    cv.line(x + 40, base - 26, x + 82, base - 34, SLATE, 3)
-    cv.line(x + 40, base - 26, x + 16, base - 18, SLATE, 3)
-    cv.poly([(x + 82, base - 34), (x + 90, base - 28), (x + 82, y + 6)],
-            SLATE)
-    cv.line(x + 86, base - 28, x + 86, base - 10, INK, 2)
-    cv.circle(x + 24, base - 10, 6, GOLD, fill=False)
-    for nx, ny in ((x + 58, y + 8), (x + 72, y + 14), (x + 60, y + 20)):
-        cv.circle(nx, ny, 2, TEAL)
-    cv.line(x + 58, y + 8, x + 72, y + 14, TEAL, 1)
-    cv.line(x + 72, y + 14, x + 60, y + 20, TEAL, 1)
-
-
-def art_tent(cv, x, y, w, h):
-    cv.poly([(x + 10, y + h - 8), (x + w // 2, y + 8),
-             (x + w - 10, y + h - 8)], (240, 240, 238))
-    cv.poly([(x + w // 2 - 10, y + h - 8), (x + w // 2, y + 24),
-             (x + w // 2 + 10, y + h - 8)], BLUE)
-    cv.line(x + w // 2, y + 8, x + w // 2, y + 2, INK, 1)
-    cv.rect(x + w // 2, y + 2, 10, 6, BLUE)
-    cv.line(x + 6, y + h - 6, x + w - 6, y + h - 6, INK, 1)
-
-
-def art_gavel(cv, x, y, w, h):
-    cv.rect(x + 8, y + 8, 30, 36, WHITE)
-    cv.frame(x + 8, y + 8, 30, 36, FAINT, 1)
-    for i in range(4):
-        cv.line(x + 12, y + 15 + i * 7, x + 34, y + 15 + i * 7, FAINT, 1)
-    cv.line(x + 52, y + 34, x + 78, y + 12, (120, 84, 40), 4)
-    cv.rect(x + 72, y + 4, 16, 9, (120, 84, 40))
-    cv.rect(x + 70, y + 13, 16, 5, (120, 84, 40))
-    cv.line(x + 46, y + 42, x + 58, y + 42, GOLD, 2)
-    cv.line(x + 84, y + 40, x + 92, y + 40, GOLD, 2)
-
-
-def art_plane(cv, x, y, w, h):
-    cy = y + 20
-    cv.poly([(x + 6, cy), (x + w - 20, cy - 4), (x + w - 6, cy + 2),
-             (x + w - 20, cy + 8), (x + 6, cy + 6)], SLATE)
-    cv.poly([(x + 14, cy - 2), (x + 24, cy - 12), (x + 32, cy - 2)],
-            SLATE)
-    cv.poly([(x + 40, cy + 4), (x + 54, cy + 16), (x + 62, cy + 4)],
-            SLATE)
-    for i in range(6):
-        cv.rect(x + 16 + i * 10, cy, 4, 3, SKY)
-    lx, ly = x + w - 30, y + 30
-    cv.rect(lx, ly + 6, 18, 13, GOLD)
-    cv.line(lx + 3, ly + 6, lx + 3, ly, GOLD, 2)
-    cv.line(lx + 15, ly + 6, lx + 15, ly + 2, GOLD, 2)
-    cv.circle(lx + 9, ly + 12, 3, INK)
-
-
-def art_server(cv, x, y, w, h):
-    for i in range(3):
-        sy = y + 6 + i * 13
-        cv.rect(x + 10, sy, 44, 10, SLATE)
-        cv.circle(x + 16, sy + 5, 2, GREEN)
-        cv.rect(x + 24, sy + 3, 24, 2, (140, 150, 165))
-    cv.poly([(x + 74, y + 8), (x + 86, y + 30), (x + 62, y + 30)],
-            GOLD)
-    cv.frame(x + 73, y + 17, 3, 7, INK, 1)
-    cv.rect(x + 73, y + 26, 3, 3, INK)
-
-
-ART = {
-    "court": art_court, "bridge": art_bridge, "factory": art_factory,
-    "boat": art_boat, "sun": art_sun, "chart": art_chart, "bell": art_bell,
-    "palm": art_palm, "ball": art_ball, "shield": art_shield,
-    "missile": art_missile, "pump": art_pump, "tent": art_tent,
-    "gavel": art_gavel, "plane": art_plane, "server": art_server,
-}
-
-
-# ------------------------------------------------------------- spotlights
-# Stories 14-17 run as illustrated spotlights at the head of the briefs.
-SPOTLIGHTS = [
-    (14, "ASIA-PACIFIC", "UNHCR HALTS MALAYSIA REGISTRATION",
-     "UN AGENCY STOPS REGISTERING ASYLUM SEEKERS; MALAYSIA BUILDS ITS "
-     "OWN SYSTEM. (REUTERS)", "tent"),
-    (15, "ASIA-PACIFIC", "INDONESIA PASSES FORFEITURE LAW",
-     "SEIZURE OF CRIME-LINKED ASSETS WITHOUT A CONVICTION, ABOVE "
-     "RP1BN IN VALUE. (REUTERS)", "gavel"),
-    (16, "AFRICA", "ETHIOPIAN AIRLINES BREACH PROBE",
-     "CYBER INCIDENT HITS THE SHEBAMILLES LOYALTY SCHEME AND ITS "
-     "5.38M MEMBERS. (REUTERS)", "plane"),
-    (17, "TECH", "PHP CRITICAL SECURITY RELEASE",
-     "EMERGENCY FIXES FOR ALL SUPPORTED VERSIONS IN A 14:00 UTC "
-     "WINDOW. (PHP.NET)", "server"),
-]
-
-
-def mini_art(cv, x, y, key):
-    if key == "tent":
-        cv.poly([(x + 2, y + 26), (x + 20, y + 4), (x + 38, y + 26)],
-                (240, 240, 238))
-        cv.poly([(x + 15, y + 26), (x + 20, y + 14), (x + 25, y + 26)],
-                BLUE)
-    elif key == "gavel":
-        cv.line(x + 8, y + 24, x + 26, y + 8, (120, 84, 40), 3)
-        cv.rect(x + 22, y + 2, 13, 7, (120, 84, 40))
-        cv.line(x + 4, y + 28, x + 34, y + 28, GOLD, 2)
-    elif key == "plane":
-        cv.poly([(x + 2, y + 16), (x + 30, y + 12), (x + 38, y + 16),
-                 (x + 30, y + 20), (x + 2, y + 20)], SLATE)
-        cv.poly([(x + 8, y + 14), (x + 15, y + 5), (x + 20, y + 14)],
-                SLATE)
-    elif key == "server":
+def glyph(draw, kind, x, y, s):
+    """Tiny scene pictograms inside an s-by-s box at (x, y)."""
+    cx, cy = x + s / 2, y + s / 2
+    if kind == "flags":
+        for i, col in enumerate((RED, GOLD, BLUE)):
+            fx = x + 6 + i * (s - 12) / 2
+            draw.line([fx, y + 8, fx, y + s - 6], fill=INK, width=2)
+            draw.rectangle([fx, y + 8, fx + (s - 12) / 2 - 4, y + 8 + s / 4],
+                           fill=col)
+        draw.line([x + 6, y + s - 6, x + s - 6, y + s - 6], fill=INK, width=2)
+    elif kind == "gavel":
+        draw.polygon([(cx - s * .3, cy - s * .3), (cx - s * .1, cy - s * .42),
+                      (cx + s * .02, cy - s * .22), (cx - s * .18, cy - s * .1)],
+                     fill=INK)
+        draw.line([cx - s * .08, cy - s * .16, cx + s * .3, cy + s * .22],
+                  fill=INK, width=max(3, int(s * .07)))
+        draw.line([x + s * .18, y + s * .82, x + s * .82, y + s * .82],
+                  fill=RED, width=3)
+    elif kind == "bridge":
+        draw.line([x + 4, cy + s * .2, x + s - 4, cy + s * .2], fill=INK, width=3)
+        for t in (0.25, 0.5, 0.75):
+            draw.line([x + s * t, y + 8, x + s * t, cy + s * .2], fill=INK, width=2)
+        draw.line([x + 4, y + 8, x + s - 4, y + 8], fill=INK, width=2)
+        draw.polygon([(cx - 6, cy - s * .22), (cx + 8, cy - s * .05),
+                      (cx - 2, cy + s * .1)], fill=RED)
+    elif kind == "factory":
+        draw.rectangle([x + 6, cy, x + s - 6, y + s - 8], outline=INK, width=2)
+        draw.rectangle([x + 10, y + s * .3, x + 20, cy], fill=INK)
+        draw.rectangle([x + 26, y + s * .42, x + 36, cy], fill=INK)
+        draw.line([x + 4, cy + s * .3, x + s - 4, cy + s * .3], fill=RED, width=3)
+    elif kind == "boat":
+        draw.polygon([(x + 8, cy), (x + s - 8, cy), (x + s - 16, cy + s * .22),
+                      (x + 16, cy + s * .22)], fill=INK)
+        draw.line([cx, y + 8, cx, cy], fill=INK, width=2)
+        draw.polygon([(cx, y + 10), (cx, cy - 2), (cx + s * .22, cy - 2)],
+                     fill=SKY, outline=INK)
         for i in range(3):
-            cv.rect(x + 4, y + 3 + i * 9, 24, 7, SLATE)
-            cv.circle(x + 8, y + 6 + i * 9, 1, GREEN)
-        cv.poly([(x + 34, y + 8), (x + 39, y + 18), (x + 29, y + 18)],
-                GOLD)
+            draw.arc([x + 6 + i * s / 3, cy + s * .26, x + 6 + (i + 1) * s / 3,
+                      cy + s * .44], 0, 180, fill=BLUE, width=2)
+    elif kind == "globe":
+        draw.ellipse([cx - s * .32, cy - s * .32, cx + s * .32, cy + s * .32],
+                     outline=GREEN, width=3)
+        draw.line([cx - s * .32, cy, cx + s * .32, cy], fill=GREEN, width=1)
+        draw.line([cx, cy - s * .32, cx, cy + s * .32], fill=GREEN, width=1)
+        draw.ellipse([cx - s * .14, cy - s * .32, cx + s * .14, cy + s * .32],
+                     outline=GREEN, width=1)
+    elif kind == "chartdown":
+        pts = [(x + 8, y + s * .3), (x + s * .35, y + s * .42),
+               (x + s * .55, y + s * .38), (x + s * .8, y + s * .66)]
+        draw.line(pts, fill=RED, width=3)
+        draw.polygon([(x + s * .8, y + s * .66), (x + s * .68, y + s * .64),
+                      (x + s * .79, y + s * .52)], fill=RED)
+        draw.line([x + 6, y + s - 8, x + s - 6, y + s - 8], fill=INK, width=1)
+    elif kind == "chip":
+        draw.rectangle([cx - s * .26, cy - s * .26, cx + s * .26, cy + s * .26],
+                       outline=INK, width=3)
+        for i in range(-1, 2):
+            draw.line([cx + i * s * .16, cy - s * .26, cx + i * s * .16,
+                       cy - s * .4], fill=INK, width=2)
+            draw.line([cx + i * s * .16, cy + s * .26, cx + i * s * .16,
+                       cy + s * .4], fill=INK, width=2)
+        draw.text((cx, cy), "AI", font=font(SANS_B, int(s * .24)), fill=BLUE,
+                  anchor="mm")
+    elif kind == "game":
+        draw.rounded_rectangle([x + 8, cy - s * .2, x + s - 8, cy + s * .2],
+                               radius=8, outline=INK, width=3)
+        draw.line([x + s * .22, cy - 6, x + s * .22, cy + 6], fill=RED, width=3)
+        draw.line([x + s * .22 - 6, cy, x + s * .22 + 6, cy], fill=RED, width=3)
+        for dx, dy in ((0, -5), (5, 0), (0, 5), (-5, 0)):
+            draw.ellipse([x + s * .72 + dx - 2, cy + dy - 2,
+                          x + s * .72 + dx + 2, cy + dy + 2], fill=BLUE)
+    elif kind == "ball":
+        draw.ellipse([cx - s * .3, cy - s * .3, cx + s * .3, cy + s * .3],
+                     outline=INK, width=3)
+        draw.line([cx - s * .3, cy, cx + s * .3, cy], fill=INK, width=1)
+        draw.arc([cx - s * .14, cy - s * .3, cx + s * .14, cy + s * .3],
+                 90, 270, fill=INK, width=1)
+        draw.arc([cx - s * .14, cy - s * .3, cx + s * .14, cy + s * .3],
+                 270, 90, fill=INK, width=1)
+    elif kind == "lock":
+        draw.rectangle([cx - s * .26, cy - s * .02, cx + s * .26, cy + s * .32],
+                       fill=INK)
+        draw.arc([cx - s * .17, cy - s * .3, cx + s * .17, cy + s * .1],
+                 180, 360, fill=INK, width=4)
+        draw.ellipse([cx - 3, cy + s * .1, cx + 3, cy + s * .1 + 6], fill=PAPER)
+    elif kind == "missile":
+        draw.polygon([(x + s * .3, y + s * .7), (x + s * .62, y + s * .38),
+                      (x + s * .72, y + s * .48), (x + s * .4, y + s * .8)],
+                     fill=INK)
+        draw.polygon([(x + s * .62, y + s * .38), (x + s * .78, y + s * .3),
+                      (x + s * .7, y + s * .46)], fill=RED)
+        draw.line([x + 8, y + s - 8, x + s * .4, y + s - 8], fill=INK, width=2)
+        draw.line([x + s * .55, y + s - 8, x + s - 8, y + s - 8], fill=INK, width=2)
+    elif kind == "oilleaf":
+        draw.ellipse([cx - s * .12, cy - s * .34, cx + s * .12, cy + s * .02],
+                     fill=INK)
+        draw.polygon([(cx - s * .26, cy + s * .3), (cx + s * .05, cy - s * .05),
+                      (cx + s * .3, cy + s * .12), (cx + s * .08, cy + s * .34),
+                      (cx - s * .14, cy + s * .3)], fill=GREEN)
+    elif kind == "idcard":
+        draw.rectangle([x + 8, y + s * .22, x + s - 8, y + s * .78],
+                       outline=INK, width=3)
+        draw.ellipse([x + s * .2, cy - s * .1, x + s * .38, cy + s * .08],
+                     fill=BLUE)
+        draw.line([x + s * .48, cy - s * .04, x + s * .8, cy - s * .04],
+                  fill=INK, width=2)
+        draw.line([x + s * .48, cy + s * .1, x + s * .8, cy + s * .1],
+                  fill=INK, width=2)
+        draw.line([x + s * .2, y + s * .66, x + s * .8, y + s * .66],
+                  fill=RED, width=3)
+    elif kind == "scales":
+        draw.line([cx, y + 8, cx, y + s - 10], fill=INK, width=3)
+        draw.line([x + 10, y + s * .22, x + s - 10, y + s * .22], fill=INK, width=2)
+        for sx in (x + 10, x + s - 10):
+            draw.polygon([(sx, y + s * .22), (sx - 8, y + s * .5),
+                          (sx + 8, y + s * .5)], outline=INK)
+        draw.line([x + s * .3, y + s - 8, x + s * .7, y + s - 8], fill=INK, width=3)
+    elif kind == "plane":
+        draw.polygon([(x + 6, cy + s * .12), (x + s * .4, cy - s * .05),
+                      (x + s - 10, cy - s * .28), (x + s - 4, cy - s * .05),
+                      (x + s * .42, cy + s * .1), (x + s * .2, cy + s * .3),
+                      (x + s * .14, cy + s * .12)], fill=INK)
+        draw.line([x + 8, y + s - 8, x + s - 8, y + s - 8], fill=BLUE, width=2)
+    elif kind == "code":
+        f = font(SANS_B, int(s * .44))
+        draw.text((cx, cy), "</>", font=f, fill=BLUE, anchor="mm")
+    else:
+        draw.ellipse([cx - 6, cy - 6, cx + 6, cy + 6], fill=GOLD)
 
 
-# ----------------------------------------------------------------- layout
-def header_strip(cv, x, y, w, label, col):
-    cv.rect(x, y, w, 13, col)
-    draw_text(cv, x + 5, y + 3, label, WHITE, 1, bold=True)
+def in_poly(lon, lat, poly):
+    inside = False
+    n = len(poly)
+    for i in range(n):
+        x1, y1 = poly[i]
+        x2, y2 = poly[(i + 1) % n]
+        if (y1 > lat) != (y2 > lat):
+            xin = x1 + (lat - y1) * (x2 - x1) / (y2 - y1)
+            if lon < xin:
+                inside = not inside
+    return inside
 
 
-def feature_panel(cv, x, y, feat):
-    n, region, place, head, body, credit, art = feat
-    w, h = 246, 112
-    cv.frame(x, y, w, h, INK, 1)
-    header_strip(cv, x, y, w, "%d - %s - %s" % (n, region, place),
-                 REGION_COL.get(region, SLATE))
-    draw_block(cv, x + 6, y + 17, head, INK, 1, 33, 9, bold=True,
-               max_lines=2)
-    ART[art](cv, x + 4, y + 40, 96, 50)
-    draw_block(cv, x + 106, y + 38, body, INK, 1, 22, 8, max_lines=7)
-    draw_text(cv, x + 6, y + 100, credit, FAINT, 1)
+def draw_map(draw, x0, y0, w, h):
+    draw.rectangle([x0, y0, x0 + w, y0 + h], fill=(233, 238, 244))
+    step = 7
+    cols = int(w / step)
+    rows = int(h / step)
+    for r in range(rows):
+        lat = 82 - (r + 0.5) * 164 / rows
+        for c in range(cols):
+            lon = -180 + (c + 0.5) * 360 / cols
+            if any(in_poly(lon, lat, p) for p in LAND):
+                px = x0 + c * step + step / 2
+                py = y0 + r * step + step / 2
+                draw.ellipse([px - 1.6, py - 1.6, px + 1.6, py + 1.6],
+                             fill=(96, 110, 128))
+    pins = [(s[0], s[5]) for s in STORIES if s[5]]
+    for num, (lon, lat) in pins:
+        px = x0 + (lon + 180) / 360 * w
+        py = y0 + (82 - lat) / 164 * h
+        draw.ellipse([px - 8, py - 8, px + 8, py + 8], fill=RED)
+        draw.text((px, py), str(num), font=font(SANS_B, 9), fill=(255, 255, 255),
+                  anchor="mm")
+    draw.text((x0 + 8, y0 + h - 18), "Featured stories 1-17, pinned",
+              font=font(SANS, 9), fill=FAINT)
 
 
-def box(cv, x, y, w, h, title, lines_fn):
-    cv.frame(x, y, w, h, INK, 1)
-    cv.rect(x, y, w, 13, INK)
-    draw_text(cv, x + 5, y + 3, title, WHITE, 1, bold=True)
-    lines_fn(x + 6, y + 18)
+def panel(draw, story, x, y, w, h, lead=False):
+    num, head, outlet, _reg, g, _pin = story
+    draw.rectangle([x, y, x + w, y + h], fill=(255, 253, 247), outline=GREY)
+    if lead:
+        gs = 64
+        glyph(draw, g, x + 10, y + (h - gs) // 2, gs)
+        draw.ellipse([x + 6, y + 6, x + 26, y + 26], fill=INK)
+        draw.text((x + 16, y + 16), str(num), font=font(SANS_B, 11),
+                  fill=(255, 255, 255), anchor="mm")
+        tx = x + 86
+        fnt, lines = fit_lines(draw, head, SANS_B, w - tx + x - 10, 15, 10, 3)
+        ty = y + 12
+        for ln in lines:
+            draw.text((tx, ty), ln, font=fnt, fill=INK)
+            ty += fnt.size + 3
+        draw.text((tx, y + h - 18), outlet.upper(), font=font(SANS, 9),
+                  fill=RED)
+    else:
+        gs = 30
+        glyph(draw, g, x + 4, y + (h - gs) // 2, gs)
+        draw.ellipse([x + 3, y + 3, x + 19, y + 19], fill=INK)
+        draw.text((x + 11, y + 11), str(num), font=font(SANS_B, 8),
+                  fill=(255, 255, 255), anchor="mm")
+        tx = x + 40
+        fnt, lines = fit_lines(draw, head, SANS, w - tx + x - 6, 9, 7, 4)
+        ty = y + 5
+        for ln in lines:
+            draw.text((tx, ty), ln, font=fnt, fill=INK)
+            ty += fnt.size + 1
 
 
-def render():
-    cv = Canvas(W, H, PAPER)
+def build():
+    img = Image.new("RGB", (W, H), PAPER)
+    d = ImageDraw.Draw(img)
 
     # masthead
-    draw_text(cv, 10, 8, "THE WORLD IN ONE DAY", INK, 3, bold=True)
-    draw_text(cv, 664, 10, "THURSDAY 19 NOVEMBER 2026", RED, 2, bold=True)
-    draw_text(cv, 10, 34,
-              "ONE IMAGE - EVERY STORY SOURCED AND NUMBERED - 52 STORIES"
-              " - 7 REGIONS - 17 ILLUSTRATED PANELS", INK, 1)
-    draw_text(cv, 840, 34, "GLOBAL EDITION - NO. 20261119", FAINT, 1)
-    cv.rect(0, 44, W, 3, RED)
-    cv.rect(0, 49, W, 1, INK)
+    d.text((W / 2, 8), "THE GLOBAL EDITION", font=font(SERIF_B, 38),
+           fill=INK, anchor="ma")
+    d.line([28, 56, W - 28, 56], fill=INK, width=3)
+    d.text((W / 2, 61), "Thursday 19 November 2026  -  The World in One Day"
+           "  -  52 stories  -  7 regions  -  every story reported that day",
+           font=font(SANS, 12), fill=FAINT, anchor="ma")
 
-    # UTC timeline band
-    cv.rect(0, 56, W, 34, INK)
-    draw_text(cv, 10, 59, "THE DAY IN UTC", GOLD, 1, bold=True)
-    tl = "  |  ".join(TIMELINE)
-    draw_block(cv, 130, 59, tl, WHITE, 1, 148, 9, max_lines=3)
+    by_num = {s[0]: s for s in STORIES}
+    # leads: stories 1 and 2
+    panel(d, by_num[1], 28, 84, 474, 104, lead=True)
+    panel(d, by_num[2], 522, 84, 474, 104, lead=True)
 
-    # lead panel
-    lx, ly, lw, lh = 8, 98, 604, 224
-    cv.frame(lx, ly, lw, lh, INK, 2)
-    header_strip(cv, lx, ly, lw,
-                 "1 - ASIA-PACIFIC - SHENZHEN, CHINA - LEAD STORY", TEAL)
-    draw_block(cv, lx + 8, ly + 19, LEAD["head"], INK, 2, 42, 17,
-               bold=True, max_lines=2)
-    art_lead(cv, lx + 8, ly + 58, lw - 16, 86)
-    draw_block(cv, lx + 8, ly + 150, LEAD["body"], INK, 1, 97, 9,
-               max_lines=6)
-    cv.rect(lx + 8, ly + 206, lw - 16, 13, SAND)
-    draw_text(cv, lx + 12, ly + 209, LEAD["proof"], INK, 1, bold=True)
-    draw_text(cv, lx + lw - 8 - text_w(LEAD["credit"], 1), ly + 209,
-              LEAD["credit"], FAINT, 1)
+    # illustrated tiles for featured 3-17: rows of 8 and 7
+    rest = [by_num[i] for i in range(3, 18)]
+    tw, th, tg = 115, 62, 6
+    for i, st in enumerate(rest):
+        row, col = divmod(i, 8)
+        px = 28 + col * (tw + tg) + (row * (tw + tg)) // 2
+        py = 196 + row * (th + tg)
+        panel(d, st, px, py, tw, th)
 
-    # map panel
-    mx, my, mw = 620, 98, 396
-    cv.frame(mx, my, mw, 224, INK, 2)
-    header_strip(cv, mx, my, mw, "THE DAY ON THE MAP", BLUE)
-    draw_text(cv, mx + 8, my + 17,
-              "PINS MATCH THE STORY NUMBERS", FAINT, 1)
-    gx, gy = mx + 14, my + 28
-    draw_map(cv, gx, gy)
-    for n, (lat, lon) in PINS.items():
-        px, py = pin_xy(gx, gy, lat, lon)
-        cv.circle(px, py, 6, RED)
-        label = str(n)
-        draw_text(cv, px - (5 if len(label) == 1 else 8), py - 3,
-                  label, WHITE, 1, bold=True)
-    draw_block(cv, mx + 8, my + 204,
-               "1 SHENZHEN 2 HAGUE 3 CRIMEA 4 GERMANY 5 SENEGAL 6 ANTALYA "
-               "7-8 NEW YORK 9 FLORIDA 10 MILWAUKEE 11 DHAKA 12 RIYADH "
-               "13 CARACAS 14 KUALA LUMPUR 15 JAKARTA 16 ADDIS 17 GREENWICH",
-               INK, 1, 64, 8, max_lines=3)
+    # map + timeline
+    my = 340
+    draw_map(d, 28, my, 636, 140)
+    tx = 680
+    d.rectangle([tx, my, W - 28, my + 140], fill=(255, 253, 247), outline=GREY)
+    d.text((tx + 10, my + 7), "THE DAY IN UTC", font=font(SANS_B, 12), fill=INK)
+    ty = my + 30
+    for hh, txt in TIMELINE:
+        d.text((tx + 10, ty), hh, font=font(SANS_B, 10), fill=BLUE)
+        fnt, lines = fit_lines(d, txt, SANS, 224, 10, 8, 2)
+        ly = ty
+        for ln in lines:
+            d.text((tx + 54, ly), ln, font=fnt, fill=INK)
+            ly += 12
+        ty += 18
 
-    # feature rows (stories 2-13)
-    rows_y = [330, 450, 570]
-    for i, feat in enumerate(FEATURES[:12]):
-        x = 8 + (i % 4) * 254
-        y = rows_y[i // 4]
-        feature_panel(cv, x, y, feat)
-
-    # boxes strip
-    by = 690
-
-    def numbers_fn(x, y):
-        for big, small in NUMBERS:
-            draw_text(cv, x, y, big, RED, 1, bold=True)
-            draw_text(cv, x + text_w(big, 1) + 12, y, "- " + small, INK, 1)
-            y += 8
-
-    def weather_fn(x, y):
-        for item in WEATHER:
-            y = draw_block(cv, x, y, item, INK, 1, 53, 8) + 3
-
-    def leftout_fn(x, y):
-        for item in LEFT_OUT:
-            y = draw_block(cv, x, y, item, INK, 1, 53, 8) + 1
-
-    box(cv, 8, by, 330, 88, "BY THE NUMBERS", numbers_fn)
-    box(cv, 346, by, 330, 88, "WEATHER AND DISASTER", weather_fn)
-    box(cv, 684, by, 330, 88, "LEFT OUT - AND WHY (DATE CHECK)",
-        leftout_fn)
-
-    # briefs
-    draw_text(cv, 8, 786,
-              "MORE OF THE DAY - STORIES 14 TO 52, IN BRIEF", INK, 1,
-              bold=True)
-    draw_text(cv, 560, 786,
-              "EVERY BRIEF NAMES ITS OUTLET; FULL CITATIONS IN SOURCES.MD",
-              FAINT, 1)
-    cv.rect(0, 796, W, 1, INK)
-    cols_x = [8, 262, 516, 770]
-    col_w, top, bottom = 246, 800, 1018
-    col = 0
-    y = top
-    blocks = []
-    for n, region, head, body, key in SPOTLIGHTS:
-        blocks.append(("spot", n, region, head, body, key))
-    for n, text in BRIEFS:
-        blocks.append(("brief", n, text))
-    for blk in blocks:
-        if blk[0] == "spot":
-            _, n, region, head, body, key = blk
-            head_lines = wrap(head, 33)
-            body_lines = wrap(body, 33)
-            need = 9 + (len(head_lines) + len(body_lines)) * 8 + 5
-            if y + need > bottom:
-                col += 1
-                y = top
-            if col > 3:
-                break
-            x = cols_x[col]
-            mini_art(cv, x + 2, y + 6, key)
-            draw_text(cv, x + 48, y, "%d - %s" % (n, region),
-                      REGION_COL.get(region, SLATE), 1, bold=True)
-            yy = y + 9
-            for ln in head_lines:
-                draw_text(cv, x + 48, yy, ln, INK, 1, bold=True)
-                yy += 8
-            for ln in body_lines:
-                draw_text(cv, x + 48, yy, ln, INK, 1)
-                yy += 8
-            y += need
-        else:
-            _, n, text = blk
-            full = "%d. %s" % (n, text)
-            lines = wrap(full, 39)
-            need = len(lines) * 8 + 2
-            if y + need > bottom:
-                col += 1
-                y = top
-            if col > 3:
-                break
-            x = cols_x[col]
+    # story columns
+    cy = 492
+    col_w = [150, 152, 118, 112, 152, 138, 128]
+    x = 28
+    for (code, label), cw in zip(REGIONS, col_w):
+        d.rectangle([x, cy, x + cw, cy + 19], fill=INK)
+        d.text((x + cw / 2, cy + 9), label.upper(), font=font(SANS_B, 9),
+               fill=(255, 255, 255), anchor="mm")
+        ty = cy + 24
+        for st in STORIES:
+            if st[3] != code:
+                continue
+            head = f"{st[0]}. {st[1]}"
+            fnt, lines = fit_lines(d, head, SANS, cw - 4, 8, 7, 3)
             for ln in lines:
-                draw_text(cv, x, y, ln, INK, 1)
-                y += 8
-            y += 2
-    return cv
+                d.text((x + 2, ty), ln, font=fnt, fill=INK)
+                ty += fnt.size + 1
+            d.text((x + 2, ty), st[2], font=font(SANS, 7), fill=RED)
+            ty += 9
+        x += cw + 3
+
+    # numbers strip
+    ny = 830
+    d.line([28, ny, W - 28, ny], fill=INK, width=2)
+    d.text((28, ny + 5), "BY THE NUMBERS", font=font(SANS_B, 12), fill=INK)
+    nx = 28
+    nw = (W - 56) / 8
+    for val, lab in NUMBERS:
+        d.text((nx + nw / 2, ny + 24), val, font=font(SERIF_B, 17), fill=RED,
+               anchor="ma")
+        fnt, lines = fit_lines(d, lab, SANS, nw - 8, 9, 7, 3)
+        ly = ny + 50
+        for ln in lines:
+            d.text((nx + nw / 2, ly), ln, font=fnt, fill=FAINT, anchor="ma")
+            ly += 10
+        nx += nw
+
+    # markets strip
+    ky = 918
+    d.rectangle([28, ky, W - 28, ky + 22], fill=SAND)
+    d.text((W / 2, ky + 11), MARKETS, font=font(SANS, 10), fill=INK, anchor="mm")
+
+    # left-out box + footer
+    by = 944
+    d.rectangle([28, by, W - 28, by + 58], outline=GREY)
+    d.text((38, by + 4), "LEFT OUT - AND WHY (the date-check box)",
+           font=font(SANS_B, 9), fill=INK)
+    ly = by + 19
+    for item in LEFT_OUT:
+        d.text((38, ly), "- " + item, font=font(SANS, 8), fill=FAINT)
+        ly += 8
+    d.text((W / 2, H - 11),
+           "Sources: Reuters, AP wires, EU Council, USA Today, The Independent,"
+           " Al Jazeera, CaixaBank Research and same-day regional press, 19 Nov 2026.",
+           font=font(SANS, 8), fill=FAINT, anchor="ma")
+    return img
 
 
 def main():
-    cv = render()
     out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
     os.makedirs(out_dir, exist_ok=True)
-    save_png(os.path.join(out_dir, "entry.png"), W, H, cv.px)
+    build().save(os.path.join(out_dir, "entry.png"))
 
 
 if __name__ == "__main__":
